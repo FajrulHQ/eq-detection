@@ -1,7 +1,7 @@
 import torch
 import os, json
 import numpy as np
-import scipy
+import scipy, copy
 from pathlib import Path as _Path
 
 import seisbench
@@ -30,6 +30,7 @@ class Solver:
         self.folder_path = _Path(f'./outputs/{folder_name}')
         self.checkpoint_path = self.folder_path / 'checkpoint'
         self.input_size = (batch_size, 3, 6000)
+        self.batch_size = batch_size
         # self.writer = SummaryWriter()
         
         os.makedirs(self.folder_path, exist_ok=True)
@@ -41,7 +42,8 @@ class Solver:
               epochs=50, 
               class_weights=[0.05, 0.40, 0.55],
               print_every_batch=15,
-              patience=12
+              patience=12,
+              adaptive_lr=False
              ):
         self.model = model
         self.class_weights = class_weights
@@ -50,7 +52,9 @@ class Solver:
         self.patience = patience
         self.current_patience = 0
         self.best_metric = np.Inf
-        self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', patience=3, factor=.5, verbose=True)
+        self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', patience=self.patience//2, factor=.5, verbose=True)
+        self.adaptive_lr = adaptive_lr
+        self.device_type = self.model.device.type
 
         for t in range(epochs):
             print(f"\nEpoch {t+1}, Learning Rate: {self.optimizer.param_groups[0]['lr']}\n-------------------------------")
@@ -67,17 +71,35 @@ class Solver:
             torch.save(self.model.state_dict(), self.checkpoint_path / f'model_checkpoint_{t+1}.h5')
 
             self.save_history()
+            self.save_plot()
+            self.save_summary()
             # early stopping
             if self.current_patience >= self.patience:
                 print(f'Early stopping after {t+1} epochs')
                 break
         
         torch.save(self.model.state_dict(), self.folder_path / f'model_final.h5')
-        self.save_summary()
         # self.writer.close()
             
     def summary(self):
         return summary(self.model, (3,6000))
+    
+    def save_plot(self):
+        n = np.random.randint(self.batch_size)
+        #n = 0
+        for batch in self.test_loader:
+            self.model.cpu()
+            dt, p, s = self.model(batch["X"])
+            pred = np.array([dt[n].detach().numpy(), p[n].detach().numpy(), s[n].detach().numpy()])
+            fig = plt.figure(figsize=(12, 6))
+            axs = fig.subplots(3, 1, sharex=True, gridspec_kw={"hspace": 0, "height_ratios": [2, 1, 1]})
+            axs[0].plot(batch["X"][n].T)
+            axs[1].plot(batch["y"][n].T)
+            axs[2].plot(pred.T)
+            self.sample = {'X': batch["X"][n], 'y': batch["y"][n], 'y_pred': torch.tensor(pred)}
+            plt.savefig(self.folder_path / 'sample_plot.png')
+            if self.device_type == 'cuda' : self.model.cuda()
+            break
 
     def save_history(self):
         matplotlib.use('Agg')
@@ -113,7 +135,7 @@ class Solver:
         summary_text += f"F1 Score\n"
         for label, title in zip(['f1_d', 'f1_p', 'f1_s'], ['detector', 'picker_p', 'picker_s']):
             score = self.history[f'test_{label}'][-1]
-            summary_text += f"\t{title}\t\t\t: {score:.4f}\n"
+            summary_text += f"\t{title}\t: {score:.4f}\n"
         summary_text += f"Total F1 Score\t: {f1:.4f}\n"
 
         with open(self.folder_path / 'summary.txt', 'w') as f:
@@ -129,18 +151,18 @@ class Solver:
 
     def _single_f1_score(self, y_pred_, y_true_, is_phase=False):
         # Threshold predictions to get binary labels
-        thres = 0.3 if is_phase else 0.5
+        thres = 0.1 if is_phase else 0.5
         y_pred = (y_pred_ > thres).float().clone()
         y_true = (y_true_ > thres).float().clone()
 
         # Calculate true positives, false positives, and false negatives for each sample in the batch
         tp = (y_pred * y_true).sum(dim=1)
-        fp = (y_pred * (1 - y_true)).sum(dim=1)
-        fn = ((1 - y_pred) * y_true).sum(dim=1)
+        tpfp = (y_pred).sum(dim=1)
+        tpfn = (y_true).sum(dim=1)
 
         # Calculate precision and recall for each sample in the batch
-        precision = tp / (tp + fp + 1e-12)
-        recall = tp / (tp + fn + 1e-12)
+        precision = tp / (tpfp + 1e-12)
+        recall = tp / (tpfn + 1e-12)
 
         # Calculate F1 score for each sample in the batch
         f1 = 2 * (precision * recall) / (precision + recall + 1e-12)
@@ -260,9 +282,11 @@ class Solver:
         self.history['test_f1_d'].append(test_f1_d)
         self.history['test_f1_p'].append(test_f1_p)
         self.history['test_f1_s'].append(test_f1_s)
+        test_f1 = sum([f1*cw for f1,cw in zip([test_f1_d,test_f1_p,test_f1_s], self.class_weights)])
 
         # Adabtive learning rate scheduler
-        self.scheduler.step(test_loss)
+        if self.adaptive_lr:
+            self.scheduler.step(test_f1)
         
         met = f"[test] "
         met += ' | '.join([
@@ -276,7 +300,6 @@ class Solver:
         ])
         print(met)
 
-        test_f1 = sum([f1*cw for f1,cw in zip([test_f1_d,test_f1_p,test_f1_s], self.class_weights)])
         return test_loss, test_f1
 
 class DetectionLabeller(SupervisedLabeller):
