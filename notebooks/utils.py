@@ -9,20 +9,23 @@ from seisbench.util import worker_seeding
 from seisbench import config
 from seisbench.generate import PickLabeller, SupervisedLabeller
 from seisbench.generate.labeling import gaussian_pick, triangle_pick, box_pick
+import seisbench.models as sbm
 
 from torch.utils.data import DataLoader
 # from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau
 from torchsummary import summary
+from thop import profile
 
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 import matplotlib
 
 class Solver:
-    def __init__(self, train_generator, test_generator, batch_size=64, num_workers=2, folder_name='test'):
+    def __init__(self, train_generator, val_generator, test_generator, batch_size=64, num_workers=2, folder_name='test'):
         self.train_loader = DataLoader(train_generator, batch_size=batch_size, shuffle=True, num_workers=num_workers, worker_init_fn=worker_seeding)
         self.test_loader = DataLoader(test_generator, batch_size=batch_size, shuffle=False, num_workers=num_workers, worker_init_fn=worker_seeding)
+        self.val_loader = DataLoader(val_generator, batch_size=batch_size, shuffle=False, num_workers=num_workers, worker_init_fn=worker_seeding)
         self.history = dict(
             train_loss=[], train_f1_d=[], train_f1_p=[], train_f1_s=[],
             test_loss=[], test_f1_d=[], test_f1_p=[], test_f1_s=[]
@@ -54,8 +57,8 @@ class Solver:
 
         for t in range(epochs):
             print(f"\nEpoch {t+1}, Learning Rate: {self.optimizer.param_groups[0]['lr']}\n-------------------------------")
-            train_loss, train_f1 = self.train_loop(self.train_loader)
-            test_loss, test_f1 = self.test_loop(self.test_loader)
+            self.train_loop(self.train_loader)
+            self.test_loop(self.val_loader)
             # self.writer.add_scalar('Train Loss', train_loss, global_step=t)
             # self.writer.add_scalar('Validation Loss', test_loss, global_step=t)
             # self.writer.add_scalar('F1 Score', test_f1, global_step=t)
@@ -75,7 +78,26 @@ class Solver:
         torch.save(self.model.state_dict(), self.folder_path / f'model_final.h5')
         self.save_summary()
         # self.writer.close()
-            
+
+    def calculate_netscore(model, a=5, b=.5, c=.5):
+        input_size = (self.batch_size, 3, 6000)
+        flops, params = profile(model, inputs=(torch.randn(*input_size),))
+
+        an = 90
+        pn = params
+        mn = (flops*2)
+
+        netscore = 20*np.log10((an**a)/(pn**b * mn**c))
+        return netscore
+    
+    def test(self, model_path, model_base):
+        self.model_path = _Path(f'outputs/{model_path}/model_final.h5')
+        assert os.path.exists(f'outputs/{model_path}'), 'Final trained model not exists'
+        self.model = model_base.load_state_dict(torch.load(self.model_path, map_location=torch.device('cpu')))
+        self.test_folder = _Path(f'outputs/test/{model_path}')
+        os.makedirs(self.test_folder, exist_ok=True)
+
+
     def summary(self):
         return summary(self.model, (3,6000))
 
@@ -129,18 +151,18 @@ class Solver:
 
     def _single_f1_score(self, y_pred_, y_true_, is_phase=False):
         # Threshold predictions to get binary labels
-        thres = 0.3 if is_phase else 0.5
+        thres = 0.1 if is_phase else 0.3
         y_pred = (y_pred_ > thres).float().clone()
         y_true = (y_true_ > thres).float().clone()
 
         # Calculate true positives, false positives, and false negatives for each sample in the batch
         tp = (y_pred * y_true).sum(dim=1)
-        fp = (y_pred * (1 - y_true)).sum(dim=1)
-        fn = ((1 - y_pred) * y_true).sum(dim=1)
+        tpfp = (y_pred).sum(dim=1)
+        tpfn = (y_true).sum(dim=1)
 
         # Calculate precision and recall for each sample in the batch
-        precision = tp / (tp + fp + 1e-12)
-        recall = tp / (tp + fn + 1e-12)
+        precision = tp / (tpfp + 1e-12)
+        recall = tp / (tpfn + 1e-12)
 
         # Calculate F1 score for each sample in the batch
         f1 = 2 * (precision * recall) / (precision + recall + 1e-12)
