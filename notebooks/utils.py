@@ -1,7 +1,7 @@
 import torch
 import os, json
 import numpy as np
-import scipy
+import scipy, copy
 from pathlib import Path as _Path
 
 import seisbench
@@ -16,13 +16,26 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau
 from torchsummary import summary
 from thop import profile
+from tqdm import tqdm
 
+from scipy.signal import find_peaks
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 import matplotlib
+import seaborn as sns
 
 class Solver:
-    def __init__(self, train_generator, val_generator, test_generator, batch_size=64, num_workers=2, folder_name='test'):
+    def __init__(self, 
+                 train_generator, 
+                 val_generator, 
+                 test_generator, 
+                 batch_size=64, 
+                 num_workers=2, 
+                 folder_name='test',
+                 patience=12,
+                 adaptive_lr=False,
+                 class_weights=[0.05, 0.40, 0.55],
+                 ):
         self.train_loader = DataLoader(train_generator, batch_size=batch_size, shuffle=True, num_workers=num_workers, worker_init_fn=worker_seeding)
         self.test_loader = DataLoader(test_generator, batch_size=batch_size, shuffle=False, num_workers=num_workers, worker_init_fn=worker_seeding)
         self.val_loader = DataLoader(val_generator, batch_size=batch_size, shuffle=False, num_workers=num_workers, worker_init_fn=worker_seeding)
@@ -33,6 +46,11 @@ class Solver:
         self.folder_path = _Path(f'./outputs/{folder_name}')
         self.checkpoint_path = self.folder_path / 'checkpoint'
         self.input_size = (batch_size, 3, 6000)
+        self.batch_size = batch_size
+        self.class_weights = class_weights
+        self.patience = patience
+        self.adaptive_lr = adaptive_lr
+        self.best_metric = np.Inf
         # self.writer = SummaryWriter()
         
         os.makedirs(self.folder_path, exist_ok=True)
@@ -42,23 +60,19 @@ class Solver:
               model,  
               learning_rate=1e-2, 
               epochs=50, 
-              class_weights=[0.05, 0.40, 0.55],
               print_every_batch=15,
-              patience=12
              ):
         self.model = model
-        self.class_weights = class_weights
         self.print_every_batch = print_every_batch
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
-        self.patience = patience
         self.current_patience = 0
-        self.best_metric = np.Inf
-        self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', patience=3, factor=.5, verbose=True)
+        self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', patience=self.patience//2, factor=.5, verbose=True)
+        self.device_type = self.model.device.type
 
         for t in range(epochs):
             print(f"\nEpoch {t+1}, Learning Rate: {self.optimizer.param_groups[0]['lr']}\n-------------------------------")
             self.train_loop(self.train_loader)
-            self.test_loop(self.val_loader)
+            self.test_loop(self.val_loader, self.model)
             # self.writer.add_scalar('Train Loss', train_loss, global_step=t)
             # self.writer.add_scalar('Validation Loss', test_loss, global_step=t)
             # self.writer.add_scalar('F1 Score', test_f1, global_step=t)
@@ -70,37 +84,142 @@ class Solver:
             torch.save(self.model.state_dict(), self.checkpoint_path / f'model_checkpoint_{t+1}.h5')
 
             self.save_history()
+            self.save_plot()
+            self.save_summary()
             # early stopping
             if self.current_patience >= self.patience:
                 print(f'Early stopping after {t+1} epochs')
                 break
         
         torch.save(self.model.state_dict(), self.folder_path / f'model_final.h5')
-        self.save_summary()
         # self.writer.close()
 
-    def calculate_netscore(model, a=5, b=.5, c=.5):
+    def calculate_netscore(self, model, an, a=2, b=.5, c=.1):
         input_size = (self.batch_size, 3, 6000)
         flops, params = profile(model, inputs=(torch.randn(*input_size),))
 
-        an = 90
         pn = params
         mn = (flops*2)
 
         netscore = 20*np.log10((an**a)/(pn**b * mn**c))
-        return netscore
+        return netscore, params, flops
     
-    def test(self, model_path, model_base):
-        self.model_path = _Path(f'outputs/{model_path}/model_final.h5')
+    def test(self, model_path, model_base, plot_batch_id=[i for i in range(6)]):
+        folder_path = _Path(f'outputs/{model_path}')
+        self.model_path = folder_path / 'model_final.h5'
         assert os.path.exists(f'outputs/{model_path}'), 'Final trained model not exists'
-        self.model = model_base.load_state_dict(torch.load(self.model_path, map_location=torch.device('cpu')))
-        self.test_folder = _Path(f'outputs/test/{model_path}')
+        self.test_folder = _Path(f'outputs/{model_path}/test')
         os.makedirs(self.test_folder, exist_ok=True)
+
+        self.test_model = model_base
+        self.test_model.load_state_dict(torch.load(self.model_path, map_location=torch.device('cpu')))
+        
+        # test_f1, test_loss = self.test_loop(self.test_loader, self.test_model)
+        test_f1 = 0
+        with open(folder_path / 'summary.txt', 'r') as f:
+            lines = f.readlines()
+        
+        for i, line in enumerate(lines):
+            if 'Total F1 Score' in line:
+                test_f1 = float(line.split(' ')[-1].replace('\t',''))
+                netscore, params, flops = self.calculate_netscore(self.test_model, test_f1*100)
+            if 'Netscore' in line:
+                lines[i] = f"Netscore\t\t\t\t: {netscore}\n"
+            if 'Parameters' in line:
+                lines[i] = f"Parameters\t\t\t: {params}\n"
+            if 'FLOP' in line:
+                lines[i] = f"FLOP\t\t\t\t\t\t: {flops}\n"
+                break 
+            if i+1 == len(lines):
+                lines.append(f"Netscore\t\t\t\t: {netscore}\n")
+                lines.append(f"Parameters\t\t\t: {params}\n")
+                lines.append(f"FLOP\t\t\t\t\t\t: {flops}\n")
+
+        with open(folder_path / 'summary.txt', 'w') as f:
+            f.writelines(lines)
+        print('Netscore already calculated\n')
+
+        self.save_plot(batch_id=plot_batch_id, dist_snr=True)
 
 
     def summary(self):
         return summary(self.model, (3,6000))
+    
+    def calculate_dist_snr(self, batchX, pred, dT=300):
+        for n in range(len(batchX)):
+            data = batchX.mean(dim=1)[n]
+            dt, p, s = (pred[0][n].detach().numpy(), pred[1][n].detach().numpy(), pred[2][n].detach().numpy())
+            dthres = (dt > 0.5)
+            plt.figure(figsize=(5,2))
+            di = np.where(dthres)[0][-1] if np.any(dthres) else -1
+            if di+dT>6000: continue
+            pi = np.argmax(p)
+            si = np.argmax(s)
+            if n<3:
+                plt.plot(data, 'k')
+                for id_,i in enumerate([di,pi,si]):
+                    plt.axvspan(i-dT, i+dT, color=f'C{id_}', alpha=.6)
+                plt.show()
 
+            for i, snr in zip([di, pi, si], 
+                              [self.snr_d, self.snr_p, self.snr_s]):
+                value = 10*np.log10(((data[i:i+dT]**2).absolute().sum())/
+                                    ((data[i-dT:i]**2).absolute().sum()+1e-5))
+                snr.append(float(value))
+
+    def save_plot(self, batch_id=0, dist_snr=False):
+        # matplotlib.use('Agg')
+        self.snr_p, self.snr_s, self.snr_d = [], [], []
+        for (bi, batch) in tqdm(enumerate(self.test_loader), total=len(self.test_loader), desc=f'Saving plot..'):
+            model = self.model.cpu() if not type(batch_id) else self.test_model.cpu()
+            dt, p, s = model(batch["X"])
+            
+            if dist_snr:
+                self.calculate_dist_snr(batch["X"], (dt,p,s))
+                fig, ax = plt.subplots(1,3, figsize=(12,6))
+                with open(self.folder_path / f'test/dist_SNR.json', 'w') as f:
+                    json.dump({'p':self.snr_p, 's':self.snr_s, 'd':self.snr_d}, f, indent=2, ensure_ascii=False)
+                
+                for i, data in enumerate([self.snr_p, self.snr_s, self.snr_d]):
+                    hist = sns.histplot(data, ax=ax[i], bins=40, alpha=0, kde=True, color=f'C{i}')
+                    for patch in hist.patches:
+                        patch.set_alpha(0)
+
+                label = ['picker_p', 'picker_s', 'coda']
+                for n in range(3):
+                    xlim = [0,100] if n<2 else [-30 ,0]
+                    # ylim = [0,len(self.test_loader)*self.batch_size//4]
+                    ax[n].set_xlim(xlim)
+                    # ax[n].set_ylim(ylim)
+                    ax[n].set_xlabel('SNR db')
+                    ax[n].set_ylabel('Frequency')
+                    ax[n].set_title(label[n])
+                plt.tight_layout()
+                plt.savefig(self.folder_path / f'test/dist_SNR.png')
+            
+            if (not type(batch_id)):
+                n = np.random.randint(self.batch_size)
+                pred = np.array([dt[n].detach().numpy(), p[n].detach().numpy(), s[n].detach().numpy()])
+                fig = plt.figure(figsize=(12, 6))
+                axs = fig.subplots(3, 1, sharex=True, gridspec_kw={"hspace": 0, "height_ratios": [2, 1, 1]})
+                axs[0].plot(batch["X"][n].T)
+                axs[1].plot(batch["y"][n].T)
+                axs[2].plot(pred.T)
+                self.sample = {'X': batch["X"][n], 'y': batch["y"][n], 'y_pred': torch.tensor(pred)}
+                plt.savefig(self.folder_path / 'sample_plot.png')
+                if self.device_type == 'cuda' : self.model.cuda()
+                break
+
+            elif bi==0:
+                for n in tqdm(batch_id, 'sample plot'):
+                    pred = np.array([dt[n].detach().numpy(), p[n].detach().numpy(), s[n].detach().numpy()])
+                    fig = plt.figure(figsize=(12, 6))
+                    axs = fig.subplots(3, 1, sharex=True, gridspec_kw={"hspace": 0, "height_ratios": [2, 1, 1]})
+                    axs[0].plot(batch["X"][n].T.detach().numpy())
+                    axs[1].plot(batch["y"][n].T.detach().numpy())
+                    axs[2].plot(pred.T)
+                    plt.savefig(self.folder_path / f'test/sample_plot{n}.png')
+            
     def save_history(self):
         matplotlib.use('Agg')
         fig, ax = plt.subplots(1,4, figsize=(16,4))
@@ -135,7 +254,7 @@ class Solver:
         summary_text += f"F1 Score\n"
         for label, title in zip(['f1_d', 'f1_p', 'f1_s'], ['detector', 'picker_p', 'picker_s']):
             score = self.history[f'test_{label}'][-1]
-            summary_text += f"\t{title}\t\t\t: {score:.4f}\n"
+            summary_text += f"\t{title}\t: {score:.4f}\n"
         summary_text += f"Total F1 Score\t: {f1:.4f}\n"
 
         with open(self.folder_path / 'summary.txt', 'w') as f:
@@ -151,7 +270,7 @@ class Solver:
 
     def _single_f1_score(self, y_pred_, y_true_, is_phase=False):
         # Threshold predictions to get binary labels
-        thres = 0.1 if is_phase else 0.3
+        thres = 0.1 if is_phase else 0.5
         y_pred = (y_pred_ > thres).float().clone()
         y_true = (y_true_ > thres).float().clone()
 
@@ -244,15 +363,15 @@ class Solver:
         train_f1 = sum([f1*cw for f1,cw in zip([train_f1_d,train_f1_p,train_f1_s], self.class_weights)])
         return train_loss, train_f1
 
-    def test_loop(self, dataloader):
+    def test_loop(self, dataloader, model):
         num_batches = len(dataloader)
         test_loss, test_loss_d, test_loss_p, test_loss_s = 0, 0, 0, 0
         test_f1_d, test_f1_p, test_f1_s = 0, 0, 0
 
         with torch.no_grad():
             for batch in dataloader:
-                pred = self.model(batch["X"].to(self.model.device))
-                true = batch["y"].to(self.model.device)
+                pred = model(batch["X"].to(model.device))
+                true = batch["y"].to(model.device)
                 loss, loss_d, loss_p, loss_s = self.loss_fn(pred, true)
                 f1_d, f1_p, f1_s = self.f1_score(true, pred)
                 
@@ -282,9 +401,11 @@ class Solver:
         self.history['test_f1_d'].append(test_f1_d)
         self.history['test_f1_p'].append(test_f1_p)
         self.history['test_f1_s'].append(test_f1_s)
+        test_f1 = sum([f1*cw for f1,cw in zip([test_f1_d,test_f1_p,test_f1_s], self.class_weights)])
 
         # Adabtive learning rate scheduler
-        self.scheduler.step(test_loss)
+        if self.adaptive_lr:
+            self.scheduler.step(test_f1)
         
         met = f"[test] "
         met += ' | '.join([
@@ -298,7 +419,6 @@ class Solver:
         ])
         print(met)
 
-        test_f1 = sum([f1*cw for f1,cw in zip([test_f1_d,test_f1_p,test_f1_s], self.class_weights)])
         return test_loss, test_f1
 
 class DetectionLabeller(SupervisedLabeller):
