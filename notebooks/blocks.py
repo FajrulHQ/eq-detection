@@ -17,10 +17,6 @@ class SeparableConv1d(nn.Module):
 
 
 class EncoderSepConv1d(nn.Module):
-    """
-    Encoder stack using separable conv. 1d
-    """
-
     def __init__(self, input_channels, filters, kernel_sizes, in_samples):
         super().__init__()
 
@@ -60,14 +56,7 @@ class EncoderSepConv1d(nn.Module):
 
 
 class DecoderSepConv1d(nn.Module):
-    def __init__(
-        self,
-        input_channels,
-        filters,
-        kernel_sizes,
-        out_samples,
-        original_compatible=False,
-    ):
+    def __init__(self, input_channels, filters, kernel_sizes, out_samples, original_compatible=False):
         super().__init__()
 
         self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
@@ -108,6 +97,7 @@ class DecoderSepConv1d(nn.Module):
             x = F.relu(separable_convs(x))
 
         return x
+
 
 class DeeperBottleneckStack(nn.Module):
     def __init__(self, kernel_sizes, filters, drop_rate):
@@ -185,6 +175,7 @@ class MultiHeadTransformerPreLN(nn.Module):
         self.norm1 = LayerNormalization(input_size)
         self.ff = FeedForward(input_size, drop_rate)
         self.norm2 = LayerNormalization(input_size)
+        self.dropout = nn.Dropout(drop_rate)
 
     def forward(self, x):
         x = self.norm1(x)
@@ -194,6 +185,7 @@ class MultiHeadTransformerPreLN(nn.Module):
         y = y.permute(0, 2, 1)
         y = self.norm2(y)
         y2 = self.ff(y)
+        y2 = self.dropout(y2)
         y2 = y + y2
 #         y2 = self.norm2(y2)
 

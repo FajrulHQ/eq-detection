@@ -104,11 +104,11 @@ class Solver:
         netscore = 20*np.log10((an**a)/(pn**b * mn**c))
         return netscore, params, flops
     
-    def test(self, model_path, model_base, plot_batch_id=[i for i in range(6)]):
+    def test(self, model_path, model_base, plot_batch_id=[i for i in range(6)], dT=300):
         folder_path = _Path(f'outputs/{model_path}')
         self.model_path = folder_path / 'model_final.h5'
         assert os.path.exists(f'outputs/{model_path}'), 'Final trained model not exists'
-        self.test_folder = _Path(f'outputs/{model_path}/test')
+        self.test_folder = _Path(f'outputs/{model_path}/test_dT{dT}')
         os.makedirs(self.test_folder, exist_ok=True)
 
         self.test_model = model_base
@@ -139,7 +139,7 @@ class Solver:
             f.writelines(lines)
         print('Netscore already calculated\n')
 
-        self.save_plot(batch_id=plot_batch_id, dist_snr=True)
+        self.save_plot(batch_id=plot_batch_id, dist_snr=True, dT=dT)
 
 
     def summary(self):
@@ -158,8 +158,10 @@ class Solver:
             if n<3:
                 plt.plot(data, 'k')
                 for id_,i in enumerate([di,pi,si]):
-                    plt.axvspan(i-dT, i+dT, color=f'C{id_}', alpha=.6)
-                plt.show()
+                    plt.axvline(i, color=f'C{id_}')
+                    plt.axvspan(i-dT, i+dT, color=f'C{id_}', alpha=.4)
+                plt.title('EQTransformer')
+                plt.savefig(self.folder_path / f'test_dT{dT}/sample_snr{n}.png')
 
             for i, snr in zip([di, pi, si], 
                               [self.snr_d, self.snr_p, self.snr_s]):
@@ -167,21 +169,21 @@ class Solver:
                                     ((data[i-dT:i]**2).absolute().sum()+1e-5))
                 snr.append(float(value))
 
-    def save_plot(self, batch_id=0, dist_snr=False):
-        # matplotlib.use('Agg')
+    def save_plot(self, batch_id=0, dist_snr=False, dT=300):
+        matplotlib.use('Agg')
         self.snr_p, self.snr_s, self.snr_d = [], [], []
         for (bi, batch) in tqdm(enumerate(self.test_loader), total=len(self.test_loader), desc=f'Saving plot..'):
             model = self.model.cpu() if not type(batch_id) else self.test_model.cpu()
             dt, p, s = model(batch["X"])
             
             if dist_snr:
-                self.calculate_dist_snr(batch["X"], (dt,p,s))
+                self.calculate_dist_snr(batch["X"], (dt,p,s), dT)
                 fig, ax = plt.subplots(1,3, figsize=(12,6))
-                with open(self.folder_path / f'test/dist_SNR.json', 'w') as f:
+                with open(self.folder_path / f'test_dT{dT}/dist_SNR.json', 'w') as f:
                     json.dump({'p':self.snr_p, 's':self.snr_s, 'd':self.snr_d}, f, indent=2, ensure_ascii=False)
                 
                 for i, data in enumerate([self.snr_p, self.snr_s, self.snr_d]):
-                    hist = sns.histplot(data, ax=ax[i], bins=40, alpha=0, kde=True, color=f'C{i}')
+                    hist = sns.histplot(data, ax=ax[i], bins=40, alpha=0, stat="frequency", kde=True, color=f'C{i}')
                     for patch in hist.patches:
                         patch.set_alpha(0)
 
@@ -195,7 +197,7 @@ class Solver:
                     ax[n].set_ylabel('Frequency')
                     ax[n].set_title(label[n])
                 plt.tight_layout()
-                plt.savefig(self.folder_path / f'test/dist_SNR.png')
+                plt.savefig(self.folder_path / f'test_dT{dT}/dist_SNR.png')
             
             if (not type(batch_id)):
                 n = np.random.randint(self.batch_size)
@@ -210,15 +212,21 @@ class Solver:
                 if self.device_type == 'cuda' : self.model.cuda()
                 break
 
-            elif bi==0:
-                for n in tqdm(batch_id, 'sample plot'):
-                    pred = np.array([dt[n].detach().numpy(), p[n].detach().numpy(), s[n].detach().numpy()])
-                    fig = plt.figure(figsize=(12, 6))
-                    axs = fig.subplots(3, 1, sharex=True, gridspec_kw={"hspace": 0, "height_ratios": [2, 1, 1]})
-                    axs[0].plot(batch["X"][n].T.detach().numpy())
-                    axs[1].plot(batch["y"][n].T.detach().numpy())
-                    axs[2].plot(pred.T)
-                    plt.savefig(self.folder_path / f'test/sample_plot{n}.png')
+            # elif bi==0:
+            #     for n in tqdm(batch_id, 'sample plot'):
+            #         pred = np.array([dt[n].detach().numpy(), p[n].detach().numpy(), s[n].detach().numpy()])
+            #         fig = plt.figure(figsize=(12, 6))
+            #         axs = fig.subplots(3, 1, sharex=True, gridspec_kw={"hspace": 0, "height_ratios": [2, 1, 1]})
+            #         axs[0].plot(batch["X"][n].T.detach().numpy())
+            #         axs[1].plot(batch["y"][n].T.detach().numpy())
+            #         axs[2].plot(pred.T)
+
+            #         axs[0].set_ylabel('Amplitude')
+            #         axs[0].legend(['BHZ', 'BHN', 'BHE'])
+            #         for i in range(2):
+            #             axs[i+1].set_ylabel('Probability')
+            #             axs[i+1].legend(['picker_p', 'picker_s', 'detector'])
+            #         plt.savefig(self.folder_path / f'sample_test/sample_plot{n}.png')
             
     def save_history(self):
         matplotlib.use('Agg')
