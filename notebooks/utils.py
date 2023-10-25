@@ -35,6 +35,8 @@ class Solver:
                  patience=12,
                  adaptive_lr=False,
                  class_weights=[0.05, 0.40, 0.55],
+                 picker_thres=0.3,
+                 detector_thres=0.5
                  ):
         self.train_loader = DataLoader(train_generator, batch_size=batch_size, shuffle=True, num_workers=num_workers, worker_init_fn=worker_seeding)
         self.test_loader = DataLoader(test_generator, batch_size=batch_size, shuffle=False, num_workers=num_workers, worker_init_fn=worker_seeding)
@@ -51,6 +53,8 @@ class Solver:
         self.patience = patience
         self.adaptive_lr = adaptive_lr
         self.best_metric = np.Inf
+        self.picker_thres = picker_thres
+        self.detector_thres = detector_thres
         # self.writer = SummaryWriter()
         
         os.makedirs(self.folder_path, exist_ok=True)
@@ -155,7 +159,7 @@ class Solver:
             if di+dT>6000: continue
             pi = np.argmax(p)
             si = np.argmax(s)
-            if n<3:
+            if n<10:
                 plt.plot(data, 'k')
                 for id_,i in enumerate([di,pi,si]):
                     plt.axvline(i, color=f'C{id_}')
@@ -269,7 +273,7 @@ class Solver:
             f.write(summary_text)
 
     def _single_loss_fn(self, y_pred, y_true, eps=1e-5):
-        y_true = (y_true > 0.5).float().clone()
+        # y_true = (y_true > 0.5).float().clone()
         h = y_true * torch.log(y_pred + eps) + (1 - y_true) * torch.log(1 - y_pred + eps)
         # h = y_true * torch.log(y_pred + eps)
         # h = h.mean(-1).sum(-1)  # Mean along sample dimension and sum along pick dimension
@@ -278,7 +282,7 @@ class Solver:
 
     def _single_f1_score(self, y_pred_, y_true_, is_phase=False):
         # Threshold predictions to get binary labels
-        thres = 0.1 if is_phase else 0.5
+        thres = self.picker_thres if is_phase else self.detector_thres
         y_pred = (y_pred_ > thres).float().clone()
         y_true = (y_true_ > thres).float().clone()
 
