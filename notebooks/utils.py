@@ -143,7 +143,7 @@ class Solver:
             f.writelines(lines)
         print('Netscore already calculated\n')
 
-        self.save_plot(batch_id=plot_batch_id, dist_snr=True, dT=dT)
+        # self.save_plot(batch_id=plot_batch_id, dist_snr=True, dT=dT)
 
 
     def summary(self):
@@ -216,21 +216,22 @@ class Solver:
                 if self.device_type == 'cuda' : self.model.cuda()
                 break
 
-            # elif bi==0:
-            #     for n in tqdm(batch_id, 'sample plot'):
-            #         pred = np.array([dt[n].detach().numpy(), p[n].detach().numpy(), s[n].detach().numpy()])
-            #         fig = plt.figure(figsize=(12, 6))
-            #         axs = fig.subplots(3, 1, sharex=True, gridspec_kw={"hspace": 0, "height_ratios": [2, 1, 1]})
-            #         axs[0].plot(batch["X"][n].T.detach().numpy())
-            #         axs[1].plot(batch["y"][n].T.detach().numpy())
-            #         axs[2].plot(pred.T)
+            elif bi==0:
+                for n in tqdm(batch_id, 'sample plot'):
+                    pred = np.array([dt[n].detach().numpy(), p[n].detach().numpy(), s[n].detach().numpy()])
+                    fig = plt.figure(figsize=(12, 6))
+                    axs = fig.subplots(3, 1, sharex=True, gridspec_kw={"hspace": 0, "height_ratios": [2, 1, 1]})
+                    axs[0].plot(batch["X"][n].T.detach().numpy())
+                    axs[1].plot(batch["y"][n].T.detach().numpy())
+                    axs[2].plot(pred.T)
 
-            #         axs[0].set_ylabel('Amplitude')
-            #         axs[0].legend(['BHZ', 'BHN', 'BHE'])
-            #         for i in range(2):
-            #             axs[i+1].set_ylabel('Probability')
-            #             axs[i+1].legend(['picker_p', 'picker_s', 'detector'])
-            #         plt.savefig(self.folder_path / f'sample_test/sample_plot{n}.png')
+                    axs[0].set_ylabel('Amplitude')
+                    axs[0].legend(['BHZ', 'BHN', 'BHE'])
+                    for i in range(2):
+                        axs[i+1].set_ylabel('Probability')
+                        axs[i+1].legend(['picker_p', 'picker_s', 'detector'])
+                    os.makedirs(self.folder_path / f'sample_test', exist_ok=True)
+                    plt.savefig(self.folder_path / f'sample_test/sample_plot{n}.png')
             
     def save_history(self):
         matplotlib.use('Agg')
@@ -432,6 +433,50 @@ class Solver:
         print(met)
 
         return test_loss, test_f1
+    
+    def plot_hist(self, base_model, n=0):
+        files = os.listdir(self.checkpoint_path)
+        data_iterator = iter(self.test_loader)
+        batch = next(data_iterator)
+        f1_d, f1_p, f1_s = 0, 0, 0
+        for (id_, file_name) in tqdm(enumerate(files), total=len(files), desc='saving_plot..'):
+            if file_name.endswith('.h5'):
+                checkpoint_model = base_model
+                checkpoint_model.load_state_dict(
+                    torch.load(self.checkpoint_path / file_name, map_location=torch.device('cpu'))
+                )
+                dt, p, s = checkpoint_model(batch["X"])
+                
+                pred = np.array([dt[n].detach().numpy(), p[n].detach().numpy(), s[n].detach().numpy()])
+                fig = plt.figure(figsize=(12, 6))
+                axs = fig.subplots(3, 1, sharex=True, gridspec_kw={"hspace": 0, "height_ratios": [2, 1, 1]})
+                axs[0].plot(batch["X"][n].T.detach().numpy())
+                axs[1].plot(batch["y"][n].T.detach().numpy())
+                axs[2].plot(pred.T)
+
+                axs[0].set_ylabel('Amplitude')
+                axs[0].legend(['BHZ', 'BHN', 'BHE'])
+                for i in range(2):
+                    axs[i+1].set_ylabel('Probability')
+                    axs[i+1].legend(['picker_p', 'picker_s', 'detector'])
+                    
+                os.makedirs(self.folder_path / 'hist_plot', exist_ok=True)
+                plt.savefig(self.folder_path / 'hist_plot' / f'sample_plot_epoch{id_}.png')
+                plt.close()
+                
+                pred = checkpoint_model(batch["X"])
+                true = batch["y"].to('cpu')
+                sample_f1_d, sample_f1_p, sample_f1_s = self.f1_score(true, pred)
+                f1_d+=sample_f1_d; f1_p+=sample_f1_p; f1_s+=sample_f1_s
+        
+        met = f"[test] "
+        met += ' | '.join([
+            f"f1_d: {f1_d/len(files):>2f}",
+            f"f1_p: {f1_p/len(files):>2f}",
+            f"f1_s: {f1_s/len(files):>2f}",
+        ])
+        print(met)
+                
 
 class DetectionLabeller(SupervisedLabeller):
     """
