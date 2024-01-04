@@ -116,7 +116,7 @@ class Solver:
         os.makedirs(self.test_folder, exist_ok=True)
 
         self.test_model = model_base
-        self.test_model.load_state_dict(torch.load(self.model_path, map_location=torch.device('cpu')))
+        self.test_model.load_state_dict(torch.load(self.model_path, map_location=torch.device(self.test_model.device)))
         
         # test_f1, test_loss = self.test_loop(self.test_loader, self.test_model)
         test_f1 = 0
@@ -143,7 +143,7 @@ class Solver:
             f.writelines(lines)
         print('Netscore already calculated\n')
 
-        # self.save_plot(batch_id=plot_batch_id, dist_snr=True, dT=dT)
+        self.save_plot(batch_id=plot_batch_id, dist_snr=True, dT=dT)
 
 
     def summary(self):
@@ -152,7 +152,7 @@ class Solver:
     def calculate_dist_snr(self, batchX, pred, dT=300):
         for n in range(len(batchX)):
             data = batchX.mean(dim=1)[n]
-            dt, p, s = (pred[0][n].detach().numpy(), pred[1][n].detach().numpy(), pred[2][n].detach().numpy())
+            dt, p, s = (pred[0][n].cpu().detach().numpy(), pred[1][n].cpu().detach().numpy(), pred[2][n].cpu().detach().numpy())
             dthres = (dt > 0.5)
             plt.figure(figsize=(5,2))
             di = np.where(dthres)[0][-1] if np.any(dthres) else -1
@@ -177,8 +177,8 @@ class Solver:
         matplotlib.use('Agg')
         self.snr_p, self.snr_s, self.snr_d = [], [], []
         for (bi, batch) in tqdm(enumerate(self.test_loader), total=len(self.test_loader), desc=f'Saving plot..'):
-            model = self.model.cpu() if not type(batch_id) else self.test_model.cpu()
-            dt, p, s = model(batch["X"])
+            model = self.model if not type(batch_id)==list else self.test_model
+            dt, p, s = model(batch["X"].float().to(self.model.device))
             
             if dist_snr:
                 self.calculate_dist_snr(batch["X"], (dt,p,s), dT)
@@ -203,22 +203,23 @@ class Solver:
                 plt.tight_layout()
                 plt.savefig(self.folder_path / f'test_dT{dT}/dist_SNR.png')
             
-            if (not type(batch_id)):
+            if (not type(batch_id) == list):
                 n = np.random.randint(self.batch_size)
-                pred = np.array([dt[n].detach().numpy(), p[n].detach().numpy(), s[n].detach().numpy()])
+                pred = np.array([dt[n].cpu().detach().numpy(), p[n].cpu().detach().numpy(), s[n].cpu().detach().numpy()])
                 fig = plt.figure(figsize=(12, 6))
                 axs = fig.subplots(3, 1, sharex=True, gridspec_kw={"hspace": 0, "height_ratios": [2, 1, 1]})
                 axs[0].plot(batch["X"][n].T)
                 axs[1].plot(batch["y"][n].T)
                 axs[2].plot(pred.T)
                 self.sample = {'X': batch["X"][n], 'y': batch["y"][n], 'y_pred': torch.tensor(pred)}
+                os.makedirs(self.folder_path / f'sample_test', exist_ok=True)
                 plt.savefig(self.folder_path / 'sample_plot.png')
                 if self.device_type == 'cuda' : self.model.cuda()
                 break
 
             elif bi==0:
                 for n in tqdm(batch_id, 'sample plot'):
-                    pred = np.array([dt[n].detach().numpy(), p[n].detach().numpy(), s[n].detach().numpy()])
+                    pred = np.array([dt[n].cpu().detach().numpy(), p[n].cpu().detach().numpy(), s[n].cpu().detach().numpy()])
                     fig = plt.figure(figsize=(12, 6))
                     axs = fig.subplots(3, 1, sharex=True, gridspec_kw={"hspace": 0, "height_ratios": [2, 1, 1]})
                     axs[0].plot(batch["X"][n].T.detach().numpy())
@@ -230,7 +231,6 @@ class Solver:
                     for i in range(2):
                         axs[i+1].set_ylabel('Probability')
                         axs[i+1].legend(['picker_p', 'picker_s', 'detector'])
-                    os.makedirs(self.folder_path / f'sample_test', exist_ok=True)
                     plt.savefig(self.folder_path / f'sample_test/sample_plot{n}.png')
             
     def save_history(self):
@@ -339,8 +339,8 @@ class Solver:
         train_loss, train_f1_d, train_f1_p, train_f1_s = 0,0,0,0
         for batch_id, batch in enumerate(dataloader):
             # Compute prediction and loss
-            pred = self.model(batch["X"].to(self.model.device))
-            true = batch["y"].to(self.model.device)
+            pred = self.model(batch["X"].float().to(self.model.device))
+            true = batch["y"].float().to(self.model.device)
             loss, loss_d, loss_p, loss_s = self.loss_fn(pred, true)
             f1_d, f1_p, f1_s = self.f1_score(true, pred)
 
@@ -383,8 +383,8 @@ class Solver:
 
         with torch.no_grad():
             for batch in dataloader:
-                pred = model(batch["X"].to(model.device))
-                true = batch["y"].to(model.device)
+                pred = model(batch["X"].float().to(model.device))
+                true = batch["y"].float().to(model.device)
                 loss, loss_d, loss_p, loss_s = self.loss_fn(pred, true)
                 f1_d, f1_p, f1_s = self.f1_score(true, pred)
                 
@@ -443,11 +443,11 @@ class Solver:
             if file_name.endswith('.h5'):
                 checkpoint_model = base_model
                 checkpoint_model.load_state_dict(
-                    torch.load(self.checkpoint_path / file_name, map_location=torch.device('cpu'))
+                    torch.load(self.checkpoint_path / file_name, map_location=torch.device(checkpoint_model.device))
                 )
                 dt, p, s = checkpoint_model(batch["X"])
                 
-                pred = np.array([dt[n].detach().numpy(), p[n].detach().numpy(), s[n].detach().numpy()])
+                pred = np.array([dt[n].cpu().detach().numpy(), p[n].cpu().detach().numpy(), s[n].cpu().detach().numpy()])
                 fig = plt.figure(figsize=(12, 6))
                 axs = fig.subplots(3, 1, sharex=True, gridspec_kw={"hspace": 0, "height_ratios": [2, 1, 1]})
                 axs[0].plot(batch["X"][n].T.detach().numpy())
@@ -465,7 +465,7 @@ class Solver:
                 plt.close()
                 
                 pred = checkpoint_model(batch["X"])
-                true = batch["y"].to('cpu')
+                true = batch["y"].to(checkpoint_model.device)
                 sample_f1_d, sample_f1_p, sample_f1_s = self.f1_score(true, pred)
                 f1_d+=sample_f1_d; f1_p+=sample_f1_p; f1_s+=sample_f1_s
         
@@ -562,7 +562,7 @@ class DetectionLabeller(SupervisedLabeller):
             if coda_>s_arrival:
                 sc = data[:, s_arrival:coda_].mean(axis=0)
                 nc = data[:, coda_:coda_+(coda_-s_arrival)].mean(axis=0)
-                snr = sc.std()/nc.std()
+                snr = sc.std()/(nc.std() + 1e-5)
                 # print(snr)
             coda_ += 40
             if coda_>p_next-1: coda_=p_next

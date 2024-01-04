@@ -6,3 +6,5 @@ notebooks/outputs/*/
 notebooks/runs/*/
 notebooks/.ipynb_checkpoints
 notebooks/__pycache__
+
+.venv

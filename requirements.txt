@@ -1,5 +1,6 @@
 matplotlib
-seisbench==0.5.3
 torch==2.0.0
 torch-summary==1.4.5
 thop==0.1.1.post2209072238
+seisbench==0.5.3
+seaborn
