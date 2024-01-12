@@ -29,14 +29,15 @@ class Solver:
                  train_generator, 
                  val_generator, 
                  test_generator, 
+                 model,  
                  batch_size=64, 
                  num_workers=2, 
                  folder_name='test',
                  patience=12,
                  adaptive_lr=False,
                  class_weights=[0.05, 0.40, 0.55],
-                 picker_thres=0.3,
-                 detector_thres=0.5
+                 picker_thres=0.1,
+                 detector_thres=0.5,
                  ):
         self.train_loader = DataLoader(train_generator, batch_size=batch_size, shuffle=True, num_workers=num_workers, worker_init_fn=worker_seeding)
         self.test_loader = DataLoader(test_generator, batch_size=batch_size, shuffle=False, num_workers=num_workers, worker_init_fn=worker_seeding)
@@ -55,18 +56,17 @@ class Solver:
         self.best_metric = np.Inf
         self.picker_thres = picker_thres
         self.detector_thres = detector_thres
+        self.model = model
         # self.writer = SummaryWriter()
         
         os.makedirs(self.folder_path, exist_ok=True)
         os.makedirs(self.checkpoint_path, exist_ok=True)
 
     def train(self, 
-              model,  
               learning_rate=1e-2, 
               epochs=50, 
               print_every_batch=15,
              ):
-        self.model = model
         self.print_every_batch = print_every_batch
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
         self.current_patience = 0
@@ -100,7 +100,8 @@ class Solver:
 
     def calculate_netscore(self, model, an, a=2, b=.5, c=.1):
         input_size = (self.batch_size, 3, 6000)
-        flops, params = profile(model, inputs=(torch.randn(*input_size),))
+        input_data = torch.randn(*input_size).to('cuda')
+        flops, params = profile(model, inputs=(input_data))
 
         pn = params
         mn = (flops*2)
@@ -115,33 +116,33 @@ class Solver:
         self.test_folder = _Path(f'outputs/{model_path}/test_dT{dT}')
         os.makedirs(self.test_folder, exist_ok=True)
 
-        self.test_model = model_base
+        self.test_model = copy.deepcopy(model_base)
         self.test_model.load_state_dict(torch.load(self.model_path, map_location=torch.device(self.test_model.device)))
         
-        # test_f1, test_loss = self.test_loop(self.test_loader, self.test_model)
+        test_f1, test_loss = self.test_loop(self.test_loader, self.test_model)
         test_f1 = 0
-        with open(folder_path / 'summary.txt', 'r') as f:
-            lines = f.readlines()
+        # with open(folder_path / 'summary.txt', 'r') as f:
+        #     lines = f.readlines()
         
-        for i, line in enumerate(lines):
-            if 'Total F1 Score' in line:
-                test_f1 = float(line.split(' ')[-1].replace('\t',''))
-                netscore, params, flops = self.calculate_netscore(self.test_model, test_f1*100)
-            if 'Netscore' in line:
-                lines[i] = f"Netscore\t\t\t\t: {netscore}\n"
-            if 'Parameters' in line:
-                lines[i] = f"Parameters\t\t\t: {params}\n"
-            if 'FLOP' in line:
-                lines[i] = f"FLOP\t\t\t\t\t\t: {flops}\n"
-                break 
-            if i+1 == len(lines):
-                lines.append(f"Netscore\t\t\t\t: {netscore}\n")
-                lines.append(f"Parameters\t\t\t: {params}\n")
-                lines.append(f"FLOP\t\t\t\t\t\t: {flops}\n")
+        # for i, line in enumerate(lines):
+        #     if 'Total F1 Score' in line:
+        #         test_f1 = float(line.split(' ')[-1].replace('\t',''))
+        #         netscore, params, flops = self.calculate_netscore(self.test_model, test_f1*100)
+        #     if 'Netscore' in line:
+        #         lines[i] = f"Netscore\t\t: {netscore}\n"
+        #     if 'Parameters' in line:
+        #         lines[i] = f"Parameters\t\t: {params}\n"
+        #     if 'FLOP' in line:
+        #         lines[i] = f"FLOP\t\t\t: {flops}\n"
+        #         break 
+        #     if i+1 == len(lines):
+        #         lines.append(f"Netscore\t\t: {netscore}\n")
+        #         lines.append(f"Parameters\t: {params}\n")
+        #         lines.append(f"FLOP\t\t\t: {flops}\n")
 
-        with open(folder_path / 'summary.txt', 'w') as f:
-            f.writelines(lines)
-        print('Netscore already calculated\n')
+        # with open(folder_path / 'summary.txt', 'w') as f:
+        #     f.writelines(lines)
+        # print('Netscore already calculated\n')
 
         self.save_plot(batch_id=plot_batch_id, dist_snr=True, dT=dT)
 
@@ -169,8 +170,9 @@ class Solver:
 
             for i, snr in zip([di, pi, si], 
                               [self.snr_d, self.snr_p, self.snr_s]):
-                value = 10*np.log10(((data[i:i+dT]**2).absolute().sum())/
-                                    ((data[i-dT:i]**2).absolute().sum()+1e-5))
+                signal =(data[i:i+dT]**2).absolute().sum()+1e-5
+                noise = (data[i-dT:i]**2).absolute().sum()+1e-5
+                value = 10*np.log10(signal/noise)
                 snr.append(float(value))
 
     def save_plot(self, batch_id=0, dist_snr=False, dT=300):
@@ -441,11 +443,11 @@ class Solver:
         f1_d, f1_p, f1_s = 0, 0, 0
         for (id_, file_name) in tqdm(enumerate(files), total=len(files), desc='saving_plot..'):
             if file_name.endswith('.h5'):
-                checkpoint_model = base_model
+                checkpoint_model = copy.deepcopy(base_model)
                 checkpoint_model.load_state_dict(
                     torch.load(self.checkpoint_path / file_name, map_location=torch.device(checkpoint_model.device))
                 )
-                dt, p, s = checkpoint_model(batch["X"])
+                dt, p, s = checkpoint_model(batch["X"].float().to(self.model.device))
                 
                 pred = np.array([dt[n].cpu().detach().numpy(), p[n].cpu().detach().numpy(), s[n].cpu().detach().numpy()])
                 fig = plt.figure(figsize=(12, 6))
@@ -464,7 +466,7 @@ class Solver:
                 plt.savefig(self.folder_path / 'hist_plot' / f'sample_plot_epoch{id_}.png')
                 plt.close()
                 
-                pred = checkpoint_model(batch["X"])
+                pred = checkpoint_model(batch["X"].float().to(self.model.device))
                 true = batch["y"].to(checkpoint_model.device)
                 sample_f1_d, sample_f1_p, sample_f1_s = self.f1_score(true, pred)
                 f1_d+=sample_f1_d; f1_p+=sample_f1_p; f1_s+=sample_f1_s
