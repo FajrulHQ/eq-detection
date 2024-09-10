@@ -166,7 +166,7 @@ class DeeperBottleneckBlock(nn.Module):
         return y
 
 class MultiHeadTransformerPreLN(nn.Module):
-    def __init__(self, input_size, drop_rate, num_heads, eps=1e-5):
+    def __init__(self, input_size, drop_rate, num_heads):
         super().__init__()
 
         self.multihead_attention = nn.MultiheadAttention(
@@ -213,3 +213,6 @@ class MultiHeadTransformer(nn.Module):
         y2 = self.norm2(y2)
 
         return y2, weight
+    
+
+        
